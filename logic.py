@@ -20,9 +20,12 @@ import datetime
 import time
 import uuid
 import aiohttp
+import aiofiles
 from aiohttp import web
 import copy
 from operator import itemgetter
+from astral import LocationInfo
+from astral.sun import sun
 
 class logic(sofabase):
     
@@ -63,6 +66,15 @@ class logic(sofabase):
         @property            
         def time(self):
             return datetime.datetime.now().time()
+
+        @property            
+        def sunrise(self):
+            return sun(self.adapter.location.observer, date=datetime.datetime.now())['sunrise'].time()
+
+        @property            
+        def sunset(self):
+            return sun(self.adapter.location.observer, date=datetime.datetime.now())['sunset'].time()
+
 
         async def Alert(self, correlationToken='', **kwargs):
             try:
@@ -135,8 +147,8 @@ class logic(sofabase):
             
         @property            
         def shortcuts(self):
-            if 'newshortcuts' in self.nativeObject:
-                return self.nativeObject['newshortcuts']
+            if 'shortcuts' in self.nativeObject:
+                return self.nativeObject['shortcuts']
             return []
 
         @property            
@@ -150,7 +162,7 @@ class logic(sofabase):
         def level(self):
             return 0
 
-        async def Snapshot(self, correlationToken='', **kwargs):
+        async def Snapshot(self, payload, correlationToken='', **kwargs):
             try:
                 self.log.info('Snapshotting Area as scene: %s %s' % (self.device.endpointId, payload))
                 await self.adapter.captureSceneFromArea(self.device.endpointId, payload)
@@ -159,9 +171,19 @@ class logic(sofabase):
                 self.adapter.log.error('!! Error during Snapshot', exc_info=True)
                 return None
 
-        async def SetChildren(self, correlationToken='', **kwargs):
+        async def SetChildren(self, payload, correlationToken='', **kwargs):
             try:
-                self.log.info('!! SetChildren is not implemented')
+                self.log.info('!! previous children of %s: %s' % (self.device.friendlyName, self.nativeObject['children']))
+                self.log.info('!! new children %s' % (payload['children']))
+                #newarea=dict(self.nativeObject)
+                #newarea['children']=payload['children']['value']
+                #await self.adapter.dataset.ingest({ 'area': { self.device.friendlyName : payload['children']['value'] }}, overwriteLevel='/%s/%s/children' % ('area', self.device.friendlyName))
+                await self.adapter.dataset.ingest(payload['children']['value'], overwriteLevel='/%s/%s/children' % ('area', self.device.friendlyName))
+
+                self.log.info('.. attempting to save %s %s' % (self.device.friendlyName, self.nativeObject))
+                await self.adapter.save_data_to_directory('area', self.device.friendlyName, self.nativeObject)
+
+                
             except:
                 self.adapter.log.error('!! Error during SetChildren', exc_info=True)
         
@@ -193,6 +215,8 @@ class logic(sofabase):
                             'insteon:node:2A 6E 80 1': {'prop':'powerState', 'value':'ON', 'time':'unknown'},
                             'hue:lights:13': {'prop':'powerState', 'value':'ON', 'time':'unknown'},
                         }
+
+            self.location=LocationInfo("San Francisco", "USA", "US/Pacific", self.dataset.baseConfig['coordinates']['lat'], self.dataset.baseConfig['coordinates']['long'])
             
             self.logicpool = ThreadPoolExecutor(10)
             self.busy=True
@@ -244,6 +268,7 @@ class logic(sofabase):
         async def virtualDel(self, datapath, data):
             
             try:
+                self.log.info('.. logic virtual del %s %s' % (datapath, data))
                 dp=datapath.split("/")
                 if dp[0]=='automation':
                     result=await self.delAutomation(dp[1])
@@ -301,12 +326,17 @@ class logic(sofabase):
                 self.log.error('Found unknown object for json dump: (%s) %s' % (type(obj),obj))
             return None
 
-        async def saveAutomation(self, name, data):
-            
+        async def saveAutomation(self,name,data):
             try:
+                self.log.info('Saving Automation %s: %s' % (name, data))
                 data=json.loads(data)
                 if name not in self.automations:
-                    self.automations[name]={"lastrun": "never", "actions": [], "conditions": [], "schedules":[], "favorite": False }
+                    self.automations[name]={"lastrun": "never", "triggers": [], "actions": [], "conditions": [], "schedules":[], "favorite": False }
+                
+                if 'name' not in data:
+                    self.automations[name]['name']=name
+                if 'filename' not in data:
+                    self.automations[name]['filename']=name+".json"
                 
                 if 'actions' in data:
                     self.automations[name]['actions']=data['actions']
@@ -316,26 +346,33 @@ class logic(sofabase):
                     self.automations[name]['triggers']=data['triggers']
                 if 'schedules' in data:
                     self.automations[name]['schedules']=data['schedules']
-                if 'favorite' in data:
-                    self.automations[name]['favorite']=data['favorite']
+                    
+                async with aiofiles.open(os.path.join(self.dataset.config['automation_directory'], name+".json"), 'w') as f:
+                    await f.write(json.dumps(self.automations[name]))
 
-                self.calculateNextRun()
-                self.saveJSON('automations',self.automations)
-                self.eventTriggers=self.buildTriggerList()
+                if name not in self.dataset.localDevices:
+                    await self.dataset.ingest({"automations": { name : self.automations[name] }})
+                #self.eventTriggers=self.buildTriggerList()
                 return True
+
             except:
                 self.log.error('Error saving automation: %s %s' % (name, data), exc_info=True)
                 return False
 
         async def saveScene(self, name, data):
-            
             try:
                 try:
                     data=json.loads(data)
                 except TypeError:
                     pass
-                self.scenes[name]={ "endpointId": "logic:scene:%s" % name, "friendlyName": name, "children": data}
-                self.saveJSON('scenes',self.scenes)
+                
+                self.scenes[name]=data
+                
+                async with aiofiles.open(os.path.join(self.dataset.config['scene_directory'], name+".json"), 'w') as f:
+                    await f.write(json.dumps(data))
+                
+                if name not in self.dataset.localDevices:
+                    await self.dataset.ingest({"scene": { name : data }})
                 return True
             except:
                 self.log.error('Error saving automation: %s %s' % (name, data), exc_info=True)
@@ -371,9 +408,11 @@ class logic(sofabase):
             
             try:
                 if name in self.automations:
+                    self.log.info('.! Deleting automation: %s' % name)
+                    if os.path.exists(os.path.join(self.dataset.config['automation_directory'],name+".json")):
+                        os.remove(os.path.join(self.dataset.config['automation_directory'],name+".json"))
                     del self.automations[name]
                 self.calculateNextRun()
-                self.saveJSON('automations',self.automations)
                 return True
             except:
                 self.log.error('Error deleting automation: %s' % name, exc_info=True)
@@ -588,25 +627,164 @@ class logic(sofabase):
             except:
                 self.log.error('Error getting since time for %s' % endpointId, exc_info=True)
                  
-                        
+
+        async def get_automations_from_directory(self):
+            
+            self.log.info('.. Loading automations')
+            automations={}
+            try:
+                automation_files=os.listdir(self.dataset.config['automation_directory'])
+                for filename in automation_files:
+                    try:
+                        async with aiofiles.open(os.path.join(self.dataset.config['automation_directory'], filename), mode='r') as automation_file:
+                            result = await automation_file.read()
+                            automation=json.loads(result)
+                            automation['filename']=filename
+                            automations[automation['name']]=automation
+                    except:
+                        self.log.error('.. error getting automation from %s' % filename)
+            except:
+                self.log.error('An error occurred while getting automations from directory: %s' % self.config['automation_directory'], exc_info=True)
+                
+            return automations
+
+        async def get_scenes_from_directory(self):
+        
+            self.log.info('.. Loading scenes')    
+            scenes={}
+            try:
+                scene_files=os.listdir(self.dataset.config['scene_directory'])
+                for filename in scene_files:
+                    try:
+                        async with aiofiles.open(os.path.join(self.dataset.config['scene_directory'], filename), mode='r') as scene_file:
+                            result = await scene_file.read()
+                            scene=json.loads(result)
+                            scene['filename']=filename
+                            scenes[scene['name']]=scene
+                    except:
+                        self.log.error('.. error getting scene from %s' % filename)
+            except:
+                self.log.error('An error occurred while getting scenes from directory: %s' % self.config['scene_directory'], exc_info=True)
+                
+            return scenes
+
+        async def get_areas_from_directory(self):
+        
+            self.log.info('.. Loading areas')    
+            areas={}
+            try:
+                area_files=os.listdir(self.dataset.config['area_directory'])
+                for filename in area_files:
+                    try:
+                        async with aiofiles.open(os.path.join(self.dataset.config['scene_directory'], filename), mode='r') as scene_file:
+                            result = await scene_file.read()
+                            scene=json.loads(result)
+                            scene['filename']=filename
+                            scenes[scene['name']]=scene
+                    except:
+                        self.log.error('.. error getting scene from %s' % filename)
+            except:
+                self.log.error('An error occurred while getting scenes from directory: %s' % self.config['scene_directory'], exc_info=True)
+                
+            return scenes
+
+        async def get_data_from_directory(self, data_type):
+        
+            data_path=""
+            data={}
+            try:
+                data_path=self.dataset.config['%s_directory' % data_type]
+                self.log.info('.. Loading %s from directory %s ' % (data_type, data_path))
+                files=os.listdir(data_path)
+                for filename in files:
+                    try:
+                        async with aiofiles.open(os.path.join(data_path, filename), mode='r') as data_file:
+                            result = await data_file.read()
+                            item=json.loads(result)
+                            item['filename']=filename
+                            data[item['name']]=item
+                    except:
+                        self.log.error('.. error getting %s from %s' % (data_type, filename))
+            except:
+                self.log.error('An error occurred while getting %s from directory: %s' % (data_type, data_path), exc_info=True)
+            return data
+
+        async def save_data_to_directory(self, data_type, item_name, data):
+        
+            try:
+                data_path=self.dataset.config['%s_directory' % data_type]
+                self.log.info('.. Saving %s %s to directory %s: %s ' % (data_type, item_name, data_path, data))
+                jsonfile = open(os.path.join(data_path, '%s.json' % item_name), 'wt')
+                json.dump(data, jsonfile, ensure_ascii=False, default=self.jsonDateHandler)
+                jsonfile.close()
+                #await self.dataset.ingest({ data_type: { item_name : data }}, overwriteLevel='/%s/%s' % (data_type, item_name))
+                
+            except:
+                self.log.error('!! Error saving data to directory: %s %s %s' % (data_type, item_name, data),exc_info=True)
+
+            return data
+
+
+        async def convert_scene_files(self, scene_directory):
+            try:
+                for name in self.oldscenes:
+                    async with aiofiles.open(os.path.join(scene_directory, name+".json"), 'w') as f:
+                        self.log.info('converting %s' % name)
+                        self.oldscenes[name]['name']=name
+                        self.oldscenes[name]['filename']=name+".json"
+                        await f.write(json.dumps(self.oldscenes[name]))
+            except:
+                self.log.error('!! error converting scenes', exc_info=True)
+
+        async def convert_old_areas(self, data_type="areas"):
+            try:
+                data_path=self.dataset.config['%s_directory' % data_type]
+                for name in self.areas:
+                    async with aiofiles.open(os.path.join(data_path, name+".json"), 'w') as f:
+                        self.log.info('fixing %s' % name)
+                        working=self.areas[name]
+                        if 'newshortcuts' in working:
+                            working['shortcuts']=list(working['newshortcuts'])
+                            del working['newshortcuts']
+                        if 'lights' in working:
+                            del working['lights']
+                        if 'scenes' in working:
+                            if type(working['scenes'])==dict:
+                                newscenes=[]
+                                for scene in working['scenes']:
+                                    newscenes.append(working['scenes'][scene]['endpointId'])
+                                working['scenes']=newscenes
+                            for scene in working['scenes']:
+                                if scene not in working['children']:
+                                    working['children'].append(scene)
+                            del working['scenes']
+                        self.log.info('Saving area: %s %s' % (name, working))
+                        await f.write(json.dumps(working))
+
+            except:
+                self.log.error('!! error converting scenes', exc_info=True)
+
+
                 
         async def start(self):
             self.polltime=1
             self.log.info('.. Starting Logic Manager')
             try:
+                self.automations={}
                 self.mailconfig=self.loadJSON('mail')
                 self.mailsender=mailSender(self.log, self.mailconfig)
                 self.users=self.loadJSON('users')
                 self.modes=self.loadJSON('modes')
-                self.areas=self.loadJSON('areas')
-                self.scenes=self.loadJSON('scenes')
-                #self.scenes=self.loadJSON('newscenes')
+                #self.oldareas=self.loadJSON('areas')
+                #self.areas=await self.convert_area_files(self.dataset.config['area_directory'])
+                self.areas=await self.get_data_from_directory('area')
+                #await self.convert_old_areas()
+                #self.scenes=await self.get_scenes_from_directory()
+                self.scenes=await self.get_data_from_directory('scene')
                 self.security=self.loadJSON('security')
-                self.automations=self.loadJSON('automations')
-                await self.fixAutomationTypes()
+                self.automations=await self.get_automations_from_directory()
                 self.regions=self.loadJSON('regions')
                 self.virtualDevices=self.loadJSON('virtualDevices')
-                self.eventTriggers=self.buildTriggerList()
                 self.calculateNextRun()
                 self.capturedDevices={}
                 await self.buildLogicCommand()
@@ -659,15 +837,16 @@ class logic(sofabase):
                 now = datetime.datetime.now()
                 for automation in self.automations:
                     try:
-                        if self.automations[automation]['nextrun']:
-                            if now>self.fixdate(self.automations[automation]['nextrun']):
-                                self.log.info('Scheduled run is due: %s %s' % (automation,self.automations[automation]['nextrun']))
-                                autodevice=self.dataset.getDeviceByEndpointId('logic:activity:%s' % automation)
-                                await autodevice.SceneController.Activate()
-                                #await self.sendAlexaCommand('Activate', 'SceneController', 'logic:activity:%s' % automation)  
-                                self.automations[automation]['lastrun']=now.isoformat()+"Z"
-                                self.calculateNextRun()
-                                await self.saveAutomation(automation, json.dumps(self.automations[automation]))
+                        if 'nextrun' in self.automations[automation]:
+                            if self.automations[automation]['nextrun']:
+                                if now>self.fixdate(self.automations[automation]['nextrun']):
+                                    self.log.info('Scheduled run is due: %s %s' % (automation,self.automations[automation]['nextrun']))
+                                    autodevice=self.dataset.getDeviceByEndpointId('logic:activity:%s' % automation)
+                                    await autodevice.SceneController.Activate()
+                                    #await self.sendAlexaCommand('Activate', 'SceneController', 'logic:activity:%s' % automation)  
+                                    self.automations[automation]['lastrun']=now.isoformat()+"Z"
+                                    self.calculateNextRun()
+                                    await self.saveAutomation(automation, json.dumps(self.automations[automation]))
                     except:
                         self.log.error('Error checking schedule for %s' % automation, exc_info=True)
             except:
@@ -678,16 +857,18 @@ class logic(sofabase):
         def addSmartDevice(self, path):
             
             try:
-                if path.split("/")[1]=="activity":
-                    return self.addSimpleActivity(path.split("/")[2])
-                elif path.split("/")[1]=="mode":
-                    return self.addSimpleMode(path.split("/")[2])
-                elif path.split("/")[1]=="scene":
-                    return self.addSimpleScene(path.split("/")[2])
-                elif path.split("/")[1]=="logic":
-                    return self.addLogicCommand(path.split("/")[2])
-                elif path.split("/")[1]=="area":
-                    return self.addArea(path.split("/")[2])
+                name=path.split("/")[2]
+                if name not in self.dataset.localDevices:
+                    if path.split("/")[1]=="activity":
+                        return self.addSimpleActivity(name)
+                    elif path.split("/")[1]=="mode":
+                        return self.addSimpleMode(name)
+                    elif path.split("/")[1]=="scene":
+                        return self.addSimpleScene(name)
+                    elif path.split("/")[1]=="logic":
+                        return self.addLogicCommand(name)
+                    elif path.split("/")[1]=="area":
+                        return self.addArea(name)
 
                 else:
                     self.log.error('Not adding: %s' % path)
@@ -721,8 +902,7 @@ class logic(sofabase):
         async def addSimpleMode(self, name):
             
             nativeObject=self.dataset.nativeDevices['mode'][name]
-            
-            if name not in self.dataset.devices:
+            if name not in self.dataset.localDevices:
                 device=devices.alexaDevice('logic/mode/%s' % name, name, displayCategories=['MODE'], description="Sofa Logic Mode", adapter=self)
                 device.PowerController=logic.PowerController(device=device)
                 device.EndpointHealth=logic.EndpointHealth(device=device)
@@ -732,7 +912,9 @@ class logic(sofabase):
         async def addSimpleActivity(self, name):
             
             nativeObject=self.dataset.nativeDevices['activity'][name]
-            if name not in self.dataset.devices:
+            if name not in self.dataset.localDevices:
+            #if name not in self.dataset.devices:
+                #self.log.info('Compare: %s %s' % (name, self.dataset.localDevices.keys()))
                 device=devices.alexaDevice('logic/activity/%s' % name, name, displayCategories=["ACTIVITY_TRIGGER"], description="Sofa Logic Activity", adapter=self)
                 device.SceneController=logic.SceneController(device=device)
                 return self.dataset.newaddDevice(device)
@@ -742,7 +924,7 @@ class logic(sofabase):
         async def addSimpleScene(self, name):
             
             nativeObject=self.dataset.nativeDevices['scene'][name]
-            
+
             if name not in self.dataset.devices:
                 device=devices.alexaDevice('logic/scene/%s' % name, name, displayCategories=["SCENE_TRIGGER"], description="Sofa Logic Activity", adapter=self)
                 device.SceneController=logic.SceneController(device=device)
@@ -752,16 +934,20 @@ class logic(sofabase):
             
         async def sendAlexaDirective(self, action, trigger={}):
             try:
+                payload={}
                 if 'value' in action:
-                    return await self.sendAlexaCommand(action['command'], action['controller'], action['endpointId'], action['value'], trigger=trigger)
-                else:
-                    return await self.sendAlexaCommand(action['command'], action['controller'], action['endpointId'], trigger=trigger)
+                    payload=action['value']
+                instance=None
+                if 'instance' in action:
+                    instance=action['instance']
+                    
+                return await self.sendAlexaCommand(action['command'], action['controller'], action['endpointId'], payload=payload, instance=instance, trigger=trigger)
             except:
                 self.log.error('Error sending alexa directive: %s' % action, exc_info=True)
                 return {}
 
 
-        async def sendAlexaCommand(self, command, controller, endpointId, payload={}, cookie={}, trigger={}):
+        async def sendAlexaCommand(self, command, controller, endpointId, payload={}, cookie={}, trigger={}, instance=None):
             
             try:
                 if trigger and command in ['Activate','Deactivate']:
@@ -769,6 +955,10 @@ class logic(sofabase):
 
                 header={"name": command, "namespace":"Alexa." + controller, "payloadVersion":"3", "messageId": str(uuid.uuid1()), "correlationToken": str(uuid.uuid1())}
                 endpoint={"endpointId": endpointId, "cookie": cookie, "scope":{ "type":"BearerToken", "token":"access-token-from-skill" }}
+
+                if instance!=None:
+                    header['instance']=instance
+
                 data={"directive": {"header": header, "endpoint": endpoint, "payload": payload }}
                 
                 changereport=await self.dataset.sendDirectiveToAdapter(data)
@@ -820,14 +1010,72 @@ class logic(sofabase):
             try:
                 for prop in deviceState:
                     if propertyName==prop['name'] and controller==prop['namespace'].split('.')[1]:
-                        self.log.info('Returning prop: %s' % prop)
+                        #self.log.info('Returning prop: %s' % prop)
                         return prop
                 
                 return False
             except:
                 self.log.error('Error finding state for condition: %s %s' % (propertyName, deviceState), exc_info=True)
 
+
         def compareCondition(self, conditionValue, operator, propertyValue):
+            
+            found_val=True
+            try:
+                for val in conditionValue:
+                    if val not in propertyValue:
+                        found_val=False
+                        break
+                    
+                    trig_val=conditionValue[val]
+                    change_val=propertyValue[val]
+                    
+                    if type(trig_val)==dict and 'value' in trig_val and 'value' in change_val:
+                        trig_val=trig_val['value']
+                        change_val=change_val['value']
+                        #self.log.info('.. switching to deep values: %s %s %s' % (change_val, operator, trig_val))
+                    
+                    if operator in ['=', '==']:
+                        if trig_val!=change_val:
+                            found_val=False
+                            break
+
+                    if operator=='!=':
+                        if trig_val==change_val:
+                            found_val=False
+                            break
+
+                    if operator=='>':
+                        if trig_val >= change_val:
+                            found_val=False
+                            break
+
+                    if operator=='>=':
+                        if trig_val > change_val:
+                            found_val=False
+                            break
+                        
+                    if operator=='<':
+                        if trig_val <= change_val:
+                            found_val=False
+                            break
+
+                    if operator=='<=':
+                        if trig_val < change_val:
+                            found_val=False
+                            break
+
+                    if operator=='contains':
+                        if str(change_val) in str(trig_val):
+                            return True
+            except:
+                self.log.error('Error comparing condition: %s %s %s' % (conditionValue, operator, propertyValue), exc_info=True)
+                found_val=False 
+                        
+            return found_val
+
+
+        def OldcompareCondition(self, conditionValue, operator, propertyValue):
             
             try:
                 if operator=='=' or operator=='==':
@@ -864,7 +1112,7 @@ class logic(sofabase):
                 for condition in conditions:
                     if condition['endpointId'] not in devstateCache:
                         devstate=await self.dataset.requestReportState(condition['endpointId'])
-                        self.log.info('devstate for %s: %s' % (condition, devstate))
+                        #self.log.info('devstate for %s: %s' % (condition, devstate))
                         devstateCache[condition['endpointId']]=devstate['context']['properties']
                     devstate=devstateCache[condition['endpointId']]
                     prop=await self.findStateForCondition(condition['controller'], condition['propertyName'], devstate)
@@ -881,14 +1129,14 @@ class logic(sofabase):
                         if et<st:
                             self.log.info('End time before start time: %s to %s' % (st,et))
                             if ct>st or ct<et:
-                                self.log.info('Passed alternate time check: %s>%s or %s<%s' % (ct, st, ct,et))
+                                #self.log.info('Passed alternate time check: %s>%s or %s<%s' % (ct, st, ct,et))
                                 pass
                             else:
-                                self.log.info('Failed alternate time check: %s>%s or %s<%s' % (ct, st, ct,et))
+                                #self.log.info('Failed alternate time check: %s>%s or %s<%s' % (ct, st, ct,et))
                                 conditionMatch=False
                                 break
                         elif st<ct and et>ct:
-                            self.log.info('Passed time check: %s<%s<%s' % (st, ct, et))
+                            #self.log.info('Passed time check: %s<%s<%s' % (st, ct, et))
                             pass
                         else:
                             self.log.info('Failed time check: %s<%s<%s' % (st, ct, et))
@@ -897,14 +1145,15 @@ class logic(sofabase):
                         
                     else:
                         condval=condition['value']
-                        if 'value' in condition['value']:
-                            condval=condition['value']['value']
+                        propval={ prop["name"] : prop["value"] }
+                        #if 'value' in condition['value']:
+                        #    condval=condition['value']['value']
 
                         if 'operator' not in condition:
+                            self.log.info('No operator in condition %s for %s %s' % (condition, activityName, conditions))
                             condition['operator']='=='
-                            self.log.info('No operator in condition for %s %s' % (activityName, conditions))
-                        if not self.compareCondition(condval,condition['operator'],prop['value']):
-                            self.log.info('!. %s did not meet condition: %s vs %s' % (activityName, prop['value'], condval))
+                        if not self.compareCondition(condval, condition['operator'], propval):
+                            self.log.info('!. %s did not meet condition: %s %s %s' % (activityName, propval, condition['operator'], condval))
                             conditionMatch=False
                             break
 
@@ -969,14 +1218,79 @@ class logic(sofabase):
                 self.log.error('Error executing activity', exc_info=True)
 
 
+        async def analyze_scene_actions(self, actions):
+            
+            try:
+                final_actions=list(actions)
+                sc={}   
+                for action in actions:
+                    self.log.info('.. analyzing scene actions: %s' % action)
+                    newact=dict(action)
+                    light_adapter=action['endpointId'].split(':')[0]
+                    newact=dict(action)
+                    del newact['endpointId']
+                    
+                    if light_adapter not in sc:
+                        #self.log.info('Adding first adapter %s entry %s' % (light_adapter,{ "actions": newact, "endpoints": [action['endpointId']] } ))
+                        sc[light_adapter]=[{ "actions": newact, "endpoints": [action['endpointId']] }]
+                        continue
+                    
+                    found=False
+                    for scene in sc[light_adapter]:
+                        if scene['actions']==newact:
+                            if action['endpointId'] not in scene['endpoints']:
+                                #self.log.info('Adding adapter %s %s entry %s' % (light_adapter, action['endpointId'], scene ))
+                                scene['endpoints'].append(action['endpointId'])
+                                found=True
+                                break
+                    if not found:
+                        #self.log.info('Adding adapter %s %s entry %s' % (light_adapter, action['endpointId'], { "actions": newact, "endpoints": [action['endpointId']] } ))
+                        sc[light_adapter].append({ "actions": newact, "endpoints": [action['endpointId']] } )
+                
+                for la in sc:
+                    for scene in sc[la]:
+                        if len(scene['endpoints'])<2:
+                            #self.log.info('.. dropping scene with 1 item: %s' % scene)
+                            sc[la].remove(scene)
+                        else:
+                            actcont=[]
+                            for ac in actions:
+                                if ac['controller'] not in actcont:
+                                    actcont.append(ac['controller'])
+                            groupres=await self.dataset.checkNativeGroup(la, actcont, scene['endpoints'])
+                            if 'id' in groupres:
+                                #self.log.info('.. preparing to remove grouped endpoints: %s / %s' % (scene['endpoints'], groupres))
+                                for action in actions:
+                                    if action['endpointId'] in scene['endpoints'] and action['command']==scene['actions']['command']:
+                                        #self.log.info('removing solo action: %s' % action)
+                                        try:
+                                            final_actions.remove(action)
+                                        except:
+                                            self.log.error('!! error removing %s from %s' % (action, final_actions))
+                                group_action=scene['actions']
+                                group_action['endpointId']=groupres['id']
+                                final_actions.append(group_action)
+                            else:
+                                self.log.info('.. no matching group from adapter: %s' % groupres)
+                                
+                
+                self.log.info('Results of analysis: %s' % final_actions)
+                return final_actions
+                    
+            except:
+                self.log.error('Error during analysis', exc_info=True)
+                return actions
+                    
+
         async def runScene(self, sceneName):
         
             try:
                 self.busy=True
                 scene=self.scenes[sceneName]
                 acts=[]
-                
+
                 for light in scene['children']:
+                        
                     if 'powerState' in scene['children'][light] and scene['children'][light]['powerState']=='OFF':
                         acts.append({'command':'TurnOff', 'controller':'PowerController', 'endpointId':light, 'value': None})
                             
@@ -990,8 +1304,11 @@ class logic(sofabase):
                                 "saturation": scene['children'][light]['saturation'],
                                 "hue": scene['children'][light]['hue'] }}})
                         else:
-                            acts.append({'command':'SetBrightness', 'controller':'BrightnessController', 'endpointId':light, 'value': { "brightness": int(scene['children'][light]['brightness']) }} )
                             acts.append({'command':'TurnOn', 'controller':'PowerController', 'endpointId':light, 'value': None})
+                            acts.append({'command':'SetBrightness', 'controller':'BrightnessController', 'endpointId':light, 'value': { "brightness": int(scene['children'][light]['brightness']) }} )
+
+
+                acts=await self.analyze_scene_actions(acts)
                 allacts = await asyncio.gather(*[self.sendAlexaDirective(action) for action in acts ])
                 self.log.info('scene %s result: %s' % (sceneName, allacts))    
                 self.busy=False
@@ -1035,16 +1352,21 @@ class logic(sofabase):
             except:
                 self.log.error('Error sending alert', exc_info=True)
                 
+
         def buildTriggerList(self):
             
-            triggerlist={}
+            triggerlist=[]
             try:
                 for automation in self.automations:
                     if 'triggers' in self.automations[automation]:
                         for trigger in self.automations[automation]['triggers']:
                             try:
                                 if trigger['type']=='property':
-                                    trigname="%s.%s.%s=%s" % (trigger['endpointId'], trigger['controller'], trigger['propertyName'], trigger['value'])
+                                    if 'value' in trigger:
+                                        trigname="%s.%s.%s=%s" % (trigger['endpointId'], trigger['controller'], trigger['propertyName'], trigger['value'])
+                                    else:
+                                        trigname="%s.%s.%s" % (trigger['endpointId'], trigger['controller'], trigger['propertyName'])
+                                        
                                 elif trigger['type']=='event':
                                     trigname="event=%s.%s.%s" % (trigger['endpointId'], trigger['controller'], trigger['propertyName'])
                                     self.log.debug('Event trigger: %s' % trigname)
@@ -1063,6 +1385,7 @@ class logic(sofabase):
                 self.log.error('Error calculating trigger shorthand:', exc_info=True)
             
             return triggerlist
+
 
         async def runEvents(self, events, change, trigger=''):
         
@@ -1096,15 +1419,17 @@ class logic(sofabase):
                 actions=[]
                 for event in events:
                     #self.log.info('.. Triggered Event: %s' % event)
-                    if event['type']=='event':
-                        action=self.events[event['name']]['action']
-                    elif event['type']=='automation':
-                        action={"controller": "SceneController", "command":"Activate", "endpointId":"logic:activity:"+event['name']}
                     
-                    if "value" in action:
-                        aval=action['value']
-                    else:
-                        action['value']=''
+                    # Did this do something important before?
+                    #if 'type' in event and if event['type']=='event':
+                    #       action=self.events[event['name']]['action']
+
+                    action={"controller": "SceneController", "command":"Activate", "endpointId":"logic:activity:"+event, "value":""}
+                    
+                    #if "value" in action:
+                    #    aval=action['value']
+                    #else:
+                    #    action['value']=''
                         
                     actions.append(action)
                 
@@ -1173,7 +1498,7 @@ class logic(sofabase):
 
                             # scenes with larger numbers of lights will have higher scores unless its divided by the number of lights
                             scenescore=scenescore / len(self.scenes[scene]['children'])
-                            #self.log.info('---- Scene %s = %s' % (child, scenescore))
+                            #self.log.info('---- Scene score %s = %s' % (child, scenescore))
                                 
                         except:
                             #self.log.error('ouch', exc_info=True)
@@ -1201,25 +1526,65 @@ class logic(sofabase):
         async def virtualAddDevice(self, deviceId, change):
             
             try:
+                
                 for area in self.areas:
                     if deviceId in self.areas[area]['children']:
                         #self.log.info('Area %s' % (self.dataset.nativeDevices['area'][area]))
                         bestscene=await self.calculateAreaLevel(area)
+            except AttributeError:
+                # areas not ready yet
+                pass
+                #self.log.error('Error in virtual add handler: %s %s' % (deviceId, change), exc_info=True)
 
             except:
                 self.log.error('Error in virtual add handler: %s %s' % (deviceId, change), exc_info=True)
                 
+
+        async def trigger_check(self, deviceId, change):
+            
+            try:
+                hits=[]
+                for automation in self.automations:
+                    if 'triggers' in self.automations[automation]:
+                        for trigger in self.automations[automation]['triggers']:
+                            if deviceId!=trigger['endpointId']:
+                                continue
+                            if change['namespace'].split('.')[1]!=trigger['controller']:
+                                continue
+                            if change['name']!=trigger['propertyName']:
+                                continue
+                            #self.log.info('So far so good: %s %s' %  (deviceId, change))
+                            if change['value']:
+                                changevalue={ change['name'] : change['value'] }
+                                #self.log.info('values: %s vs %s' % (changevalue, trigger['value']))
+                                if 'operator' not in trigger:
+                                    trigger['operator']='='
+                                if self.compareCondition(trigger['value'], trigger['operator'], changevalue):
+                                    self.log.info('!!!!!! Active trigger: %s (%s vs %s)' % (automation, trigger, change))
+                                    hits.append(automation) 
+                if hits:
+                    self.loop.run_in_executor(self.logicpool, self.runEventsThread, hits, change, "", self.loop)
+            except:
+                self.log.error('Error during new trigger check', exc_info=True)
+                                    
+                                    
        
         async def virtualChangeHandler(self, deviceId, change):
             
             try:
                 now=datetime.datetime.now()
-                trigname="%s.%s.%s=%s" % (deviceId, change['namespace'].split('.')[1], change['name'], change['value'])
-                if trigname in self.eventTriggers:
-                    self.log.info('!+ This is a trigger we are watching for: %s %s' % (trigname, change))
-                    change['endpointId']=deviceId
-                    self.loop.run_in_executor(self.logicpool, self.runEventsThread, self.eventTriggers[trigname], change, trigname, self.loop)
-                    #await self.runEvents(self.eventTriggers[trigname], change, trigname)
+                #if 'value' in change:
+                #    trigname="%s.%s.%s=%s" % (deviceId, change['namespace'].split('.')[1], change['name'], change['value'])
+                #else:
+                #    trigname="%s.%s.%s" % (deviceId, change['namespace'].split('.')[1], change['name'])
+                await self.trigger_check(deviceId, change)
+                #if trigname in self.eventTriggers:
+                #    self.log.info('!+ This is a trigger we are watching for: %s %s' % (trigname, change))
+                #    change['endpointId']=deviceId
+                #    self.loop.run_in_executor(self.logicpool, self.runEventsThread, self.eventTriggers[trigname], change, trigname, self.loop)
+                #    #await self.runEvents(self.eventTriggers[trigname], change, trigname)
+                ##else:
+                ##    self.log.info('!- This is NOT a trigger we are watching for: %s %s' % (trigname, change))
                 
                 for area in self.areas:
                     if deviceId in self.areas[area]['children']:
@@ -1233,18 +1598,18 @@ class logic(sofabase):
             except:
                 self.log.error('Error in virtual change handler: %s %s' % (deviceId, change), exc_info=True)
 
-        async def virtualEventHandler(self, event, source, deviceId, message):
+        #async def virtualEventHandler(self, event, source, deviceId, message):
             
-            try:
-                trigname="event=%s.%s.%s" % (deviceId, source, event)
-                self.log.info('Event trigger: %s' % trigname)
-                if trigname in self.eventTriggers:
-                    self.log.info('!+ This is an event trigger we are watching for: %s %s' % (trigname, message))
-                    #await self.runEvents(self.eventTriggers[trigname], message, trigname)
-                    self.loop.run_in_executor(self.logicpool, self.runEventsThread, self.eventTriggers[trigname], message, trigname, self.loop)
+        #    try:
+        #        trigname="event=%s.%s.%s" % (deviceId, source, event)
+        #        self.log.info('Event trigger: %s' % trigname)
+        #        if trigname in self.eventTriggers:
+        #            self.log.info('!+ This is an event trigger we are watching for: %s %s' % (trigname, message))
+        #            #await self.runEvents(self.eventTriggers[trigname], message, trigname)
+        #            self.loop.run_in_executor(self.logicpool, self.runEventsThread, self.eventTriggers[trigname], message, trigname, self.loop)
 
-            except:
-                self.log.error('Error in virtual event handler: %s %s %s' % (event, deviceId, message), exc_info=True)
+        #    except:
+        #        self.log.error('Error in virtual event handler: %s %s %s' % (event, deviceId, message), exc_info=True)
 
 
         async def buildRegion(self, thisRegion=None):
@@ -1270,6 +1635,8 @@ class logic(sofabase):
         async def virtualList(self, itempath, query={}):
 
             try:
+                self.log.info('Logic list request: %s %s' % (itempath, query))
+                
                 if itempath=="automations":
                     return self.automations
 
@@ -1300,9 +1667,9 @@ class logic(sofabase):
                 if itempath=="areas":
                     return self.areas
 
-                if itempath=="events":
-                    self.loadEvents()
-                    return {"events": self.events, "triggers": self.eventTriggers}
+                #if itempath=="events":
+                #    self.loadEvents()
+                #    return {"events": self.events, "triggers": self.eventTriggers}
                     
                 if itempath=="regions":
                     return await self.buildRegion()
@@ -1359,6 +1726,12 @@ class logic(sofabase):
                         if ip[1] in self.areas:
                             result['lights']=self.areas[ip[1]]['lights']
                         return result
+                    if ip[0]=='scene':
+                        if ip[1] in self.scenes:
+                            
+                            return self.scenes[ip[1]]
+                        else:
+                            result={}
                     
                 return {}
 
