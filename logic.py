@@ -128,12 +128,15 @@ class logic(sofabase):
                 if 'triggerEndpointId' in cookie:
                     triggerEndPointId=cookie['triggerEndPointId']
                 if self.deviceid in self.adapter.automations:
+                    activation_started_report=self.ActivationStarted()
+                    run_id="%s-%s" % (activation_started_report['event']['endpoint']['endpointId'], activation_started_report['event']['payload']['timestamp'])
                     if 'conditions' in cookie:
-                        task = asyncio.create_task(self.adapter.runActivity(self.deviceid, trigger, triggerEndPointId, conditions=cookie['conditions']))
+                        task = asyncio.create_task(self.adapter.runActivity(self.deviceid, trigger, triggerEndPointId, conditions=cookie['conditions'], run_id=run_id))
                     else:
-                        task = asyncio.create_task(self.adapter.runActivity(self.deviceid, trigger, triggerEndPointId))
+                        task = asyncio.create_task(self.adapter.runActivity(self.deviceid, trigger, triggerEndPointId, run_id=run_id))
                     #self.log.info('Started automation as task: %s /%s' % (device, task))
-                    return self.ActivationStarted()
+                    activation_started_report=self.ActivationStarted()
+                    return activation_started_report
                     # This should return the scene started ack
                 elif self.deviceid in self.adapter.scenes:
                     await self.adapter.runScene(self.deviceid)
@@ -217,13 +220,13 @@ class logic(sofabase):
             return ['ALL']    
 
         def __init__(self, log=None, loop=None, dataset=None, notify=None, request=None, config=None, **kwargs):
-            self.config=config
+            super().__init__(log=log, loop=loop, dataset=dataset, config=config)
             self.automations={}
             self.areas={}
-            self.dataset=dataset
             self.dataset.nativeDevices['scene']={}
             self.dataset.nativeDevices['activity']={}
             self.native_group_cache={}
+            self.running_activities={}
             
             self.dataset.nativeDevices['logic']={}
             self.dataset.nativeDevices['mode']={}
@@ -237,14 +240,7 @@ class logic(sofabase):
             
             self.logicpool = ThreadPoolExecutor(10)
             self.busy=True
-
-            #self.definitions=definitions.Definitions
-            self.log=log
             self.notify=notify
-            if not loop:
-                self.loop = asyncio.new_event_loop()
-            else:
-                self.loop=loop
                 
 
         async def virtualAdd(self, datapath, data):
@@ -367,7 +363,7 @@ class logic(sofabase):
                 async with aiofiles.open(os.path.join(self.config.automation_directory, name+".json"), 'w') as f:
                     await f.write(json.dumps(self.automations[name]))
 
-                if name not in self.dataset.localDevices:
+                if "logic:activity:%s" % name not in self.dataset.localDevices:
                     await self.dataset.ingest({"automations": { name : self.automations[name] }})
                 #self.eventTriggers=self.buildTriggerList()
                 return True
@@ -388,7 +384,7 @@ class logic(sofabase):
                 async with aiofiles.open(os.path.join(self.dataset.config.scene_directory, name+".json"), 'w') as f:
                     await f.write(json.dumps(data))
                 
-                if name not in self.dataset.localDevices:
+                if "logic:scene:%s" % name not in self.dataset.localDevices:
                     await self.dataset.ingest({"scene": { name : data }})
                 return True
             except:
@@ -756,7 +752,6 @@ class logic(sofabase):
             except:
                 self.log.error('!! error converting scenes', exc_info=True)
 
-
         async def pre_activate(self):
             
             self.polltime=1
@@ -773,7 +768,6 @@ class logic(sofabase):
                 self.security=self.loadJSON('security')
                 self.automations=await self.get_data_from_directory('automation')
                 self.regions=self.loadJSON('regions')
-                self.virtualDevices=self.loadJSON('virtualDevices')
                 self.capturedDevices={}
                 self.calculateNextRun()
                 await self.buildLogicCommand()
@@ -784,9 +778,10 @@ class logic(sofabase):
                 for area in self.areas:
                     await self.dataset.ingest({"area": { area : self.areas[area] }})
                     
+                if 'All' not in self.areas:
+                    await self.dataset.ingest({"area": { "All" : { "scene": "", "children": list(self.areas.keys()), "name": "All" }}})
+                    
                 for auto in self.automations:
-                    if auto=="Turn off Front Lights in the morning":
-                        self.log.info('TOF: %s' % self.automations[auto]  )
                     await self.dataset.ingest({"activity": { auto : self.automations[auto] }})
 
                 for mode in self.modes:
@@ -804,7 +799,7 @@ class logic(sofabase):
             try:
                 for item in self.since:
                     self.since[item]['time']=await self.get_since(item,self.since[item])
-                    
+                self.polling_task = asyncio.create_task(self.pollSchedule())    
                 self.log.info('.. tracking time since for items: %s' % self.since)
             except:
                 self.log.error('Error during post_activate', exc_info=True)
@@ -813,13 +808,13 @@ class logic(sofabase):
                 
         async def start(self):
             self.log.info('.. Starting Logic Manager')
-            try:
-                self.polling_task = asyncio.create_task(self.pollSchedule())
-            
-            except GeneratorExit:
-                self.running=False    
-            except:
-                self.log.error('Error loading cached devices', exc_info=True)
+            #try:
+            #    self.polling_task = asyncio.create_task(self.pollSchedule())
+            #
+            #except GeneratorExit:
+            #    self.running=False    
+            #except:
+            #    self.log.error('Error loading cached devices', exc_info=True)
                 
         async def pollSchedule(self):
             
@@ -946,86 +941,64 @@ class logic(sofabase):
                     
                 
         # Adapter Overlays that will be called from dataset
-        def addSmartDevice(self, path):
+        async def addSmartDevice(self, path):
             
             try:
-                name=path.split("/")[2]
-                if name not in self.dataset.localDevices:
+                device_id=path.split("/")[2]
+                device_type=path.split("/")[1]
+                endpointId="%s:%s:%s" % ("logic", device_type, device_id)
+                nativeObject=self.dataset.nativeDevices[device_type][device_id]
+                if endpointId not in self.dataset.localDevices:
                     if path.split("/")[1]=="activity":
-                        return self.addSimpleActivity(name)
+                        return await self.addSimpleActivity(device_id, nativeObject)
                     elif path.split("/")[1]=="mode":
-                        return self.addSimpleMode(name)
+                        return await self.addSimpleMode(device_id, nativeObject)
                     elif path.split("/")[1]=="scene":
-                        return self.addSimpleScene(name)
+                        return await self.addSimpleScene(device_id, nativeObject)
                     elif path.split("/")[1]=="logic":
-                        return self.addLogicCommand(name)
+                        return await self.addLogicCommand(device_id, nativeObject)
                     elif path.split("/")[1]=="area":
-                        return self.addArea(name)
-
+                        return await self.addArea(device_id, nativeObject)
                 else:
                     self.log.error('Not adding: %s' % path)
 
             except:
                 self.log.error('Error defining smart device', exc_info=True)
-                return False
-                
-        async def addArea(self, name):
-        
-            nativeObject=self.dataset.nativeDevices['area'][name]
-            
-            if name not in self.dataset.devices:
-                device=devices.alexaDevice('logic/area/%s' % name, name, displayCategories=["AREA"], description="Sofa Logic Command", adapter=self)
-                device.AreaController=logic.AreaController(device=device)
-                return self.dataset.newaddDevice(device)
-
-            return False
-
-
-        async def addLogicCommand(self, name):
-        
-            nativeObject=self.dataset.nativeDevices['logic']['command']
-            
-            if name not in self.dataset.devices:
-                device=devices.alexaDevice('logic/logic/command', 'Logic', displayCategories=["LOGIC"], description="Sofa Logic Command", adapter=self)
-                device.LogicController=logic.LogicController(device=device)
-                return self.dataset.newaddDevice(device)
-            return False
-
-        async def addSimpleMode(self, name):
-            
-            nativeObject=self.dataset.nativeDevices['mode'][name]
-            if name not in self.dataset.localDevices:
-                device=devices.alexaDevice('logic/mode/%s' % name, name, displayCategories=['MODE'], description="Sofa Logic Mode", adapter=self)
-                device.PowerController=logic.PowerController(device=device)
-                device.EndpointHealth=logic.EndpointHealth(device=device)
-                return self.dataset.newaddDevice(device)
             return False
                 
-        async def addSimpleActivity(self, name):
-            
-            nativeObject=self.dataset.nativeDevices['activity'][name]
-            if name not in self.dataset.localDevices:
-            #if name not in self.dataset.devices:
-                #self.log.info('Compare: %s %s' % (name, self.dataset.localDevices.keys()))
-                device=devices.alexaDevice('logic/activity/%s' % name, name, displayCategories=["ACTIVITY_TRIGGER"], description="Sofa Logic Activity", adapter=self)
-                device.SceneController=logic.SceneController(device=device)
-                return self.dataset.newaddDevice(device)
+        async def addArea(self, device_id, nativeObject):
+            device=devices.alexaDevice('logic/area/%s' % device_id, device_id, displayCategories=["AREA"], description="Sofa Logic Command", adapter=self)
+            device.AreaController=logic.AreaController(device=device)
+            return self.dataset.add_device(device)
 
-            return False
+        async def addLogicCommand(self, device_id, nativeObject):
+        
+            device=devices.alexaDevice('logic/logic/command', 'Logic', displayCategories=["LOGIC"], description="Sofa Logic Command", adapter=self)
+            device.LogicController=logic.LogicController(device=device)
+            return self.dataset.add_device(device)
 
-        async def addSimpleScene(self, name):
-            
-            nativeObject=self.dataset.nativeDevices['scene'][name]
+        async def addSimpleMode(self, device_id, nativeObject):
+            device=devices.alexaDevice('logic/mode/%s' % device_id, device_id, displayCategories=['MODE'], description="Sofa Logic Mode", adapter=self)
+            device.PowerController=logic.PowerController(device=device)
+            device.EndpointHealth=logic.EndpointHealth(device=device)
+            return self.dataset.add_device(device)
+                
+        async def addSimpleActivity(self, device_id, nativeObject):
+            device=devices.alexaDevice('logic/activity/%s' % device_id, device_id, displayCategories=["ACTIVITY_TRIGGER"], description="Sofa Logic Activity", adapter=self)
+            device.SceneController=logic.SceneController(device=device)
+            return self.dataset.add_device(device)
 
-            if name not in self.dataset.devices:
-                device=devices.alexaDevice('logic/scene/%s' % name, name, displayCategories=["SCENE_TRIGGER"], description="Sofa Logic Activity", adapter=self)
-                device.SceneController=logic.SceneController(device=device)
-                return self.dataset.newaddDevice(device)
-            return False
+        async def addSimpleScene(self, device_id, nativeObject):
+            device=devices.alexaDevice('logic/scene/%s' % device_id, device_id, displayCategories=["SCENE_TRIGGER"], description="Sofa Logic Activity", adapter=self)
+            device.SceneController=logic.SceneController(device=device)
+            return self.dataset.add_device(device)
             
             
         async def sendAlexaDirective(self, action, trigger={}):
             try:
+                if action['endpointId'].split(':')[0] in self.adapters_not_responding:
+                    return devices.ErrorResponse(action['endpointId'],"BRIDGE_UNREACHABLE","Adapter in non-responsive list for logic")
+                    
                 payload={}
                 url=None
                 if 'value' in action:
@@ -1244,28 +1217,38 @@ class logic(sofabase):
                 self.log.error('Error with chunky Activity', exc_info=True)  
                 return False
                 
-        async def runActivity(self, activityName, trigger={}, triggerEndpointId='', conditions=True):
+        async def runActivity(self, activityName, trigger={}, triggerEndpointId='', conditions=True, run_id=None):
             
             try:
-
+                if not run_id:
+                    run_id="%s-%s" % (activityName, datetime.datetime.now())
+                    
+                self.running_activities[run_id]={ "name": activityName, "conditions": conditions, "start": datetime.datetime.now(), "state":"start", "active":True }
                 if 'conditions' in self.automations[activityName] and conditions==True:
                     if not await self.checkLogicConditions(self.automations[activityName]['conditions'], activityName=activityName):
+                        self.running_activities[run_id]["state"]="failed_condition"
+                        self.running_activities[run_id]["active"]=False
                         return False
 
                 self.busy=True                
                 activity=self.automations[activityName]['actions']
                 chunk=[]
+                self.running_activities[run_id]["state"]="chunk"
                 for action in activity:
+                    result=[]
                     if action['command']=="Delay":
                         chunk.append(action)
+                        self.running_activities[run_id]["state"]="delay"
                         result=await self.runActivityChunk(chunk)
                         #self.log.info('Result of Pre-Delay chunk: %s' % result)
                         chunk=[]
                     elif action['command']=="Wait":
+                        self.running_activities[run_id]["state"]="wait"
                         result=await self.runActivityChunk(chunk)
                         #self.log.info('Result of chunk: %s' % result)
                         chunk=[]
                     elif action['command']=="Alert":
+                        self.running_activities[run_id]["state"]="alert"
                         alert=copy.deepcopy(action)
                         if trigger:
                             self.log.info('Trigger: %s' % trigger)
@@ -1279,13 +1262,19 @@ class logic(sofabase):
                         chunk.append(alert)
                                 
                     else:
+                        self.running_activities[run_id]["state"]="chunk"
                         chunk.append(action)
+                        
+                    await self.checkActivityErrors(result)
+                    
                 if chunk:
                     result=await self.runActivityChunk(chunk)
-
+                    await self.checkActivityErrors(result)
+                
+                self.running_activities[run_id]["state"]="finish"
                 self.automations[activityName]['lastrun']=datetime.datetime.now().isoformat()+"Z"
                 await self.saveAutomation(activityName, json.dumps(self.automations[activityName]))
-                
+                self.running_activities[run_id]["active"]=False
                 self.busy=False   
                 return result
                 
@@ -1299,6 +1288,28 @@ class logic(sofabase):
                 return allacts
             except:
                 self.log.error('Error executing activity', exc_info=True)
+
+
+        async def checkActivityErrors(self, results):
+            try:
+                for result in results:
+                    if 'event' not in result:
+                        self.log.warning('!. activity item response does not contain an event: %s' % result)
+                        
+                    elif result['event']['header']['name']=='ErrorResponse':
+                        self.log.error('!! Error in activity for %s: %s %s' % (act['event']['endpoint']['endpointId'], act['payload']['type'], act['payload']['message']))
+                        if result['payload']['type']=='BRIDGE_UNREACHABLE':
+                            pass
+                            # TODO/CHEESE 10/7/20 - This should update state cache with unreachable on the endpointhealth if the
+                            # error response is not already being processed elsewhere first
+                            
+                            # chasing adapters by portion of endpoint id should be deprecated overall and unnecessary for most 
+                            # non-hub adapters, but logic may be special due to activity/scene processing
+                            
+                            #if act['event']['endpoint']['endpointId'].split(':')[0] not in self.adapters_not_responding:
+                            #    self.adapters_not_responding.append(act['event']['endpoint']['endpointId'].split(':')[0])
+            except:
+                self.log.error('Error handling activity errors', exc_info=True)                            
 
 
         async def analyze_scene_actions(self, actions):
@@ -1364,10 +1375,13 @@ class logic(sofabase):
                 
                 self.log.debug('.. result of scene analysis: %s' % final_actions)
                 return final_actions
-                    
+            
+            except AttributeError:
+                self.log.warning('!! native group calculations are disabled (no adapter map')
+            
             except:
                 self.log.error('!! error during scene analysis', exc_info=True)
-                return actions
+            return actions
                     
 
         async def runScene(self, sceneName):
@@ -1546,7 +1560,8 @@ class logic(sofabase):
                 devstate_cache={}
                 highscore=0
                 bestscene=""
-                self.log.debug('.. calculating area level: %s %s' % (area,self.areas[area]['children']))
+                #self.log.info('.. calculating area level: %s %s' % (area,self.areas[area]['children']))
+                state_reports=await self.request_state_reports(self.areas[area]['children'])
                 for child in self.areas[area]['children']:
                     if child.startswith('logic:scene:'):
                         scenescore=0
@@ -1556,20 +1571,7 @@ class logic(sofabase):
                             continue
                         
                         try:
-                            getlights=[]
-                            for light in self.scenes[scene]['children']:
-                                if light not in devstate_cache and light in self.dataset.devices:
-                                    getlights.append(light)
-                                    
-                            if getlights:
-                                #self.log.info('Calculation pending for device states: %s' % getlights)
-                                newdevs = await asyncio.gather(*[self.dataset.requestReportState(light) for light in getlights ])
-                                for dev in newdevs:
-                                    if 'event' in dev:
-                                        devstate_cache[dev['event']['endpoint']['endpointId']]=dev
-                                    else:
-                                        self.log.warning('.. device state missing: %s' % dev)
-                                
+                            light_reports=await self.request_state_reports(self.scenes[scene]['children'])
                             for light in self.scenes[scene]['children']:
                                 devbri=0
                                 if 'powerState' in self.scenes[scene]['children'][light] and self.scenes[scene]['children'][light]['powerState']=='OFF':
@@ -1577,8 +1579,8 @@ class logic(sofabase):
                                 else:
                                     scenebri=self.scenes[scene]['children'][light]['brightness']
 
-                                if light in devstate_cache:
-                                    for prop in devstate_cache[light]['context']['properties']:
+                                try:
+                                    for prop in self.state_cache[light]:
                                         if prop['name']=="powerState":
                                             if prop['value']=='OFF':
                                                 devbri=0
@@ -1589,6 +1591,9 @@ class logic(sofabase):
                                             if prop['value']['value']=='UNREACHABLE':
                                                 devbri=0
                                                 break
+                                except KeyError:
+                                    self.log.error('!! device not in state cache: %s' % light, exc_info=True)
+                                    devbri=0
                                 
                                 scenescore+=(50-abs(devbri-scenebri))
 
@@ -1597,7 +1602,7 @@ class logic(sofabase):
                             #self.log.info('---- Scene score %s = %s' % (child, scenescore))
                                 
                         except:
-                            self.log.error('ouch', exc_info=True)
+                            self.log.error('!! error getting light level for area scene compute: %s %s' % (area, child), exc_info=True)
                             scenescore=0
                             break
                             
@@ -1684,7 +1689,7 @@ class logic(sofabase):
                 if deviceId in self.since:
                     if change['value']==self.since[deviceId]['value'] and change['name']==self.since[deviceId]['prop']:
                         self.since[deviceId]['time']=now.isoformat()+"Z"
-                        self.log.info('Updated Since: %s %s' % (deviceId,self.since[deviceId]))
+                        self.log.info('.. since time update: %s %s' % (deviceId,self.since[deviceId]))
 
             except:
                 self.log.error('Error in virtual change handler: %s %s' % (deviceId, change), exc_info=True)
@@ -1731,6 +1736,9 @@ class logic(sofabase):
 
                 if itempath in self.dataset.lists:
                     return self.dataset.lists[itempath]
+
+                if itempath=="activity":
+                    return self.running_activities
                 
                 if itempath=="automations":
                     return self.automations
@@ -1765,9 +1773,6 @@ class logic(sofabase):
                     
                 if itempath=="regions":
                     return await self.buildRegion()
-
-                if itempath=="virtualDevices":
-                    return self.virtualDevices
                     
                 if itempath=="automationlist":
                     al={}
