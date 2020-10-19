@@ -996,9 +996,6 @@ class logic(sofabase):
             
         async def sendAlexaDirective(self, action, trigger={}):
             try:
-                if action['endpointId'].split(':')[0] in self.adapters_not_responding:
-                    return devices.ErrorResponse(action['endpointId'],"BRIDGE_UNREACHABLE","Adapter in non-responsive list for logic")
-                    
                 payload={}
                 url=None
                 if 'value' in action:
@@ -1297,7 +1294,7 @@ class logic(sofabase):
                         self.log.warning('!. activity item response does not contain an event: %s' % result)
                         
                     elif result['event']['header']['name']=='ErrorResponse':
-                        self.log.error('!! Error in activity for %s: %s %s' % (act['event']['endpoint']['endpointId'], act['payload']['type'], act['payload']['message']))
+                        self.log.error('!! Error in activity for %s: %s %s' % (result['event']['endpoint']['endpointId'], result['payload']['type'], result['payload']['message']))
                         if result['payload']['type']=='BRIDGE_UNREACHABLE':
                             pass
                             # TODO/CHEESE 10/7/20 - This should update state cache with unreachable on the endpointhealth if the
@@ -1520,19 +1517,7 @@ class logic(sofabase):
             try:
                 actions=[]
                 for event in events:
-                    #self.log.info('.. Triggered Event: %s' % event)
-                    
-                    # Did this do something important before?
-                    #if 'type' in event and if event['type']=='event':
-                    #       action=self.events[event['name']]['action']
-
                     action={"controller": "SceneController", "command":"Activate", "endpointId":"logic:activity:"+event, "value":""}
-                    
-                    #if "value" in action:
-                    #    aval=action['value']
-                    #else:
-                    #    action['value']=''
-                        
                     actions.append(action)
                 
                 allacts = asyncio.ensure_future(asyncio.gather(*[self.sendAlexaDirective(action, trigger=change) for action in actions ], loop=loop), loop=loop)
@@ -1544,16 +1529,23 @@ class logic(sofabase):
         async def calculateAreaLevel(self, area):
             
             try:
-                if 'logic:scene:' not in ', '.join(self.areas[area]['children']):
-                    return ''
                 if area in self.area_calc_pending:
                     return ''
-
+                    
                 if self.busy:
                     if area not in self.area_calc_deferred:
                         self.area_calc_deferred.append(area)
-                    return ''                
-
+                    return ''  
+                    
+                area_scenes=[]
+                for item in self.areas[area]['children']:
+                    if item in self.dataset.localDevices and 'SCENE_TRIGGER' in self.dataset.localDevices[item].displayCategories:
+                        if item not in area_scenes:
+                            area_scenes.append(item)
+                
+                if len(area_scenes)<1: # no local scenes in area
+                    return ""
+              
                 #self.log.info('pending: %s' % self.area_calc_pending)
                 self.area_calc_pending.append(area)
                 
@@ -1562,24 +1554,24 @@ class logic(sofabase):
                 bestscene=""
                 #self.log.info('.. calculating area level: %s %s' % (area,self.areas[area]['children']))
                 state_reports=await self.request_state_reports(self.areas[area]['children'])
-                for child in self.areas[area]['children']:
-                    if child.startswith('logic:scene:'):
-                        scenescore=0
-                        scene=child.split(':')[2]
-                        if scene not in self.scenes:
-                            self.log.info('.. scene %s (in %s) does not exist. This data error should be fixed manually.' % (child,area))
-                            continue
-                        
-                        try:
-                            light_reports=await self.request_state_reports(self.scenes[scene]['children'])
-                            for light in self.scenes[scene]['children']:
-                                devbri=0
-                                if 'powerState' in self.scenes[scene]['children'][light] and self.scenes[scene]['children'][light]['powerState']=='OFF':
-                                    scenebri=0
-                                else:
-                                    scenebri=self.scenes[scene]['children'][light]['brightness']
+                for child in area_scenes:
+                    scenescore=0
+                    scene=child.split(':')[2]
+                    if scene not in self.scenes:
+                        self.log.warning('!! scene %s (in %s) does not exist in scene definition file. This data error should be fixed manually.' % (child,area))
+                        continue
+                    
+                    try:
+                        light_reports=await self.request_state_reports(self.scenes[scene]['children'])
+                        for light in self.scenes[scene]['children']:
+                            devbri=0
+                            if 'powerState' in self.scenes[scene]['children'][light] and self.scenes[scene]['children'][light]['powerState']=='OFF':
+                                scenebri=0
+                            else:
+                                scenebri=self.scenes[scene]['children'][light]['brightness']
 
-                                try:
+                            try:
+                                if light in self.state_cache:
                                     for prop in self.state_cache[light]:
                                         if prop['name']=="powerState":
                                             if prop['value']=='OFF':
@@ -1591,24 +1583,26 @@ class logic(sofabase):
                                             if prop['value']['value']=='UNREACHABLE':
                                                 devbri=0
                                                 break
-                                except KeyError:
-                                    self.log.error('!! device not in state cache: %s' % light, exc_info=True)
+                                else:
                                     devbri=0
-                                
-                                scenescore+=(50-abs(devbri-scenebri))
-
-                            # scenes with larger numbers of lights will have higher scores unless its divided by the number of lights
-                            scenescore=scenescore / len(self.scenes[scene]['children'])
-                            #self.log.info('---- Scene score %s = %s' % (child, scenescore))
-                                
-                        except:
-                            self.log.error('!! error getting light level for area scene compute: %s %s' % (area, child), exc_info=True)
-                            scenescore=0
-                            break
+                            except KeyError:
+                                self.log.error('!! device not in state cache: %s' % light, exc_info=True)
+                                devbri=0
                             
-                        if scenescore>highscore:
-                            highscore=scenescore
-                            bestscene=child
+                            scenescore+=(50-abs(devbri-scenebri))
+
+                        # scenes with larger numbers of lights will have higher scores unless its divided by the number of lights
+                        scenescore=scenescore / len(self.scenes[scene]['children'])
+                        #self.log.info('---- Scene score %s = %s' % (child, scenescore))
+                            
+                    except:
+                        self.log.error('!! error getting light level for area scene compute: %s %s' % (area, child), exc_info=True)
+                        scenescore=0
+                        break
+                        
+                    if scenescore>highscore:
+                        highscore=scenescore
+                        bestscene=child
                 
                 if area in self.area_calc_pending:
                     self.area_calc_pending.remove(area)
